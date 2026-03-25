@@ -1,0 +1,28 @@
+{
+  "name": "shifthub",
+  "private": true,
+  "scripts": {
+    "build": "turbo run build",
+    "dev": "turbo run dev",
+    "lint": "turbo run lint",
+    "typecheck": "turbo run typecheck",
+    "db:generate": "pnpm --filter @shifthub/db exec prisma generate",
+    "db:push": "dotenv -e .env.local -e .env -- pnpm --filter @shifthub/db run db:push",
+    "db:push:force": "dotenv -e .env.local -e .env -- pnpm --filter @shifthub/db run db:push:force",
+    "db:migrate": "dotenv -e .env.local -e .env -- pnpm --filter @shifthub/db exec prisma migrate dev",
+    "db:studio": "dotenv -e .env.local -e .env -- pnpm --filter @shifthub/db exec prisma studio",
+    "db:seed": "dotenv -e .env.local -e .env -- pnpm --filter @shifthub/db exec prisma db seed"
+  },
+  "devDependencies": {
+    "dotenv-cli": "^8.0.0",
+    "turbo": "^2.4.4",
+    "typescript": "^5.7.3"
+  },
+  "pnpm": {
+    "onlyBuiltDependencies": ["@clerk/shared", "@prisma/client", "@prisma/engines", "esbuild", "prisma", "sharp", "unrs-resolver"]
+  },
+  "packageManager": "pnpm@10.27.0",
+  "engines": {
+    "node": ">=20"
+  }
+}

@@ -1,0 +1,296 @@
+generator client {
+  provider = "prisma-client"
+  output   = "../src/generated/prisma"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+enum Role {
+  PHYSICIAN
+  APP
+  ADMIN
+}
+
+enum CoverageCategory {
+  OUTPATIENT_PROCEDURE
+  OFFICE_LOCATION
+  INPATIENT_HOSPITAL
+  WEEKEND_CALL
+  APP_COVERAGE_ROTATION
+}
+
+enum InpatientSplit {
+  DAY
+  NIGHT
+}
+
+enum ShiftStatus {
+  DRAFT
+  PUBLISHED
+}
+
+enum ScheduleVersionStatus {
+  DRAFT
+  PUBLISHED
+}
+
+enum RequestStatus {
+  PENDING
+  APPROVED
+  DENIED
+  CANCELLED
+}
+
+enum SwapStatus {
+  PENDING_COUNTERPARTY
+  PENDING_ADMIN
+  APPROVED
+  DENIED
+  CANCELLED
+}
+
+enum IntegrationProvider {
+  OUTLOOK
+  QGENDA
+  GOOGLE
+  ICLOUD
+}
+
+// Application data (profile, role, schedules, etc.) lives here. Clerk only provides sign-in; clerkId links the session.
+model User {
+  id        String   @id @default(cuid())
+  clerkId   String   @unique
+  email     String
+  name      String
+  phone     String?
+  role      Role     @default(PHYSICIAN)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  shiftsAssigned        Shift[]              @relation("ShiftAssignee")
+  giveUpRequests        GiveUpRequest[]      @relation("GiveUpRequester")
+  pickupRequests        PickupRequest[]      @relation("PickupRequester")
+  swapRequestsAsA       SwapRequest[]        @relation("SwapUserA")
+  swapRequestsAsB       SwapRequest[]        @relation("SwapUserB")
+  changeRequests        ChangeRequest[]
+  auditLogs             AuditLog[]
+  timeOffEntries        TimeOffEntry[]
+  integrationAccounts   IntegrationAccount[]
+  externalBusyBlocks    ExternalBusyBlock[]
+  personalLabels        Label[]              @relation("UserPersonalLabels")
+  messagePosts          MessagePost[]
+  favoriteFilters       FavoriteFilter[]
+  siteVisibilityPrefs   UserSiteVisibility[]
+  showOwnExternalTitles Boolean              @default(false)
+}
+
+model OrgSettings {
+  id                        String   @id @default("default")
+  contactDirectoryVisible   Boolean  @default(false)
+  adminNotificationEmail    String?
+  updatedAt                 DateTime @updatedAt
+}
+
+model Site {
+  id        String   @id @default(cuid())
+  name      String   @unique
+  colorHex  String
+  sortOrder Int      @default(0)
+  createdAt DateTime @default(now())
+
+  shifts           Shift[]
+  visibilityPrefs  UserSiteVisibility[]
+}
+
+model Label {
+  id        String   @id @default(cuid())
+  name      String
+  isGlobal  Boolean  @default(true)
+  userId    String?
+  user      User?    @relation("UserPersonalLabels", fields: [userId], references: [id], onDelete: Cascade)
+  createdAt DateTime @default(now())
+
+  @@unique([name, userId])
+}
+
+model ScheduleVersion {
+  id        String                @id @default(cuid())
+  label     String
+  year      Int
+  status    ScheduleVersionStatus @default(DRAFT)
+  createdAt DateTime              @default(now())
+  updatedAt DateTime              @updatedAt
+
+  shifts Shift[]
+}
+
+model Shift {
+  id                String            @id @default(cuid())
+  scheduleVersionId String
+  scheduleVersion   ScheduleVersion   @relation(fields: [scheduleVersionId], references: [id], onDelete: Cascade)
+  siteId            String
+  site              Site              @relation(fields: [siteId], references: [id])
+  coverageCategory  CoverageCategory
+  inpatientSplit    InpatientSplit?
+  startsAt          DateTime
+  endsAt            DateTime
+  status            ShiftStatus       @default(DRAFT)
+  assigneeId        String?
+  assignee          User?             @relation("ShiftAssignee", fields: [assigneeId], references: [id])
+
+  giveUpRequests GiveUpRequest[]
+  pickupRequests PickupRequest[]
+  swapRequestsA  SwapRequest[]   @relation("SwapShiftA")
+  swapRequestsB  SwapRequest[]   @relation("SwapShiftB")
+  auditLogs      AuditLog[]
+
+  @@index([scheduleVersionId, startsAt])
+  @@index([assigneeId, startsAt])
+}
+
+model GiveUpRequest {
+  id          String        @id @default(cuid())
+  shiftId     String
+  shift       Shift         @relation(fields: [shiftId], references: [id], onDelete: Cascade)
+  requesterId String
+  requester   User          @relation("GiveUpRequester", fields: [requesterId], references: [id])
+  status      RequestStatus @default(PENDING)
+  createdAt   DateTime      @default(now())
+  resolvedAt  DateTime?
+
+  openedToGroup Boolean @default(false)
+}
+
+model PickupRequest {
+  id            String        @id @default(cuid())
+  shiftId       String
+  shift         Shift         @relation(fields: [shiftId], references: [id], onDelete: Cascade)
+  requesterId   String
+  requester     User          @relation("PickupRequester", fields: [requesterId], references: [id])
+  status        RequestStatus @default(PENDING)
+  locksSlot     Boolean       @default(false)
+  createdAt     DateTime      @default(now())
+  resolvedAt    DateTime?
+
+  @@index([shiftId, status])
+}
+
+model SwapRequest {
+  id            String     @id @default(cuid())
+  shiftAId      String
+  shiftA        Shift      @relation("SwapShiftA", fields: [shiftAId], references: [id], onDelete: Cascade)
+  shiftBId      String
+  shiftB        Shift      @relation("SwapShiftB", fields: [shiftBId], references: [id], onDelete: Cascade)
+  userAId       String
+  userA         User       @relation("SwapUserA", fields: [userAId], references: [id])
+  userBId       String
+  userB         User       @relation("SwapUserB", fields: [userBId], references: [id])
+  status        SwapStatus @default(PENDING_COUNTERPARTY)
+  counterpartAcceptedAt DateTime?
+  createdAt     DateTime   @default(now())
+  resolvedAt    DateTime?
+}
+
+model ChangeRequest {
+  id          String        @id @default(cuid())
+  userId      String
+  user        User          @relation(fields: [userId], references: [id])
+  title       String
+  body        String
+  status      RequestStatus @default(PENDING)
+  createdAt   DateTime      @default(now())
+  resolvedAt  DateTime?
+}
+
+model AuditLog {
+  id        String   @id @default(cuid())
+  shiftId   String?
+  shift     Shift?   @relation(fields: [shiftId], references: [id], onDelete: SetNull)
+  actorId   String
+  actor     User     @relation(fields: [actorId], references: [id])
+  action    String
+  payload   Json
+  createdAt DateTime @default(now())
+
+  @@index([shiftId, createdAt])
+}
+
+model TimeOffEntry {
+  id        String   @id @default(cuid())
+  userId    String
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  startsAt  DateTime
+  endsAt    DateTime
+  note      String?
+  createdAt DateTime @default(now())
+
+  @@index([userId, startsAt])
+}
+
+model IntegrationAccount {
+  id           String              @id @default(cuid())
+  userId       String
+  user         User                @relation(fields: [userId], references: [id], onDelete: Cascade)
+  provider     IntegrationProvider
+  accessToken  String
+  refreshToken String?
+  expiresAt    DateTime?
+  createdAt    DateTime            @default(now())
+  updatedAt    DateTime            @updatedAt
+
+  @@unique([userId, provider])
+}
+
+model ExternalBusyBlock {
+  id              String   @id @default(cuid())
+  userId          String
+  user            User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  startsAt        DateTime
+  endsAt          DateTime
+  titleEncrypted  String?
+  showTitleToUser Boolean  @default(false)
+  source          IntegrationProvider?
+  createdAt       DateTime @default(now())
+
+  @@index([userId, startsAt])
+}
+
+model UserSiteVisibility {
+  userId String
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+  siteId String
+  site   Site   @relation(fields: [siteId], references: [id], onDelete: Cascade)
+  hidden Boolean @default(false)
+
+  @@id([userId, siteId])
+}
+
+model FavoriteFilter {
+  id        String   @id @default(cuid())
+  userId    String
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  name      String
+  payload   Json
+  createdAt DateTime @default(now())
+}
+
+model MessageThread {
+  id        String        @id @default(cuid())
+  subject   String
+  relatedType String
+  relatedId String
+  createdAt DateTime      @default(now())
+  posts     MessagePost[]
+}
+
+model MessagePost {
+  id        String        @id @default(cuid())
+  threadId  String
+  thread    MessageThread @relation(fields: [threadId], references: [id], onDelete: Cascade)
+  authorId  String
+  author    User          @relation(fields: [authorId], references: [id])
+  body      String
+  createdAt DateTime      @default(now())
+}

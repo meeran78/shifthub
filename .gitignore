@@ -1,0 +1,16 @@
+node_modules
+.turbo
+.next
+dist
+.expo
+*.log
+.env
+.env.local
+.env*.local
+.DS_Store
+*.tsbuildinfo
+coverage
+.vercel
+android
+ios
+packages/db/src/generated
