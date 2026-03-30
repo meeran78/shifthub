@@ -164,15 +164,17 @@ model GiveUpRequest {
 }
 
 model PickupRequest {
-  id            String        @id @default(cuid())
-  shiftId       String
-  shift         Shift         @relation(fields: [shiftId], references: [id], onDelete: Cascade)
-  requesterId   String
-  requester     User          @relation("PickupRequester", fields: [requesterId], references: [id])
-  status        RequestStatus @default(PENDING)
-  locksSlot     Boolean       @default(false)
-  createdAt     DateTime      @default(now())
-  resolvedAt    DateTime?
+  id             String        @id @default(cuid())
+  shiftId        String
+  shift          Shift         @relation(fields: [shiftId], references: [id], onDelete: Cascade)
+  requesterId    String
+  requester      User          @relation("PickupRequester", fields: [requesterId], references: [id])
+  status         RequestStatus @default(PENDING)
+  locksSlot      Boolean       @default(false)
+  createdAt      DateTime      @default(now())
+  resolvedAt     DateTime?
+  /// Admin explanation when pickup is denied (required on deny)
+  resolutionNote String?
 
   @@index([shiftId, status])
 }
@@ -191,6 +193,8 @@ model SwapRequest {
   counterpartAcceptedAt DateTime?
   createdAt     DateTime   @default(now())
   resolvedAt    DateTime?
+  /// Admin explanation when swap is denied
+  resolutionNote String?
 }
 
 model ChangeRequest {

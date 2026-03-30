@@ -356,6 +356,12 @@ export const appRouter = router({
         const shift = await ctx.prisma.shift.findUniqueOrThrow({
           where: { id: input.shiftId },
         });
+        if (shift.status !== "PUBLISHED") {
+          throw new TRPCError({
+            code: "BAD_REQUEST",
+            message: "Only published shifts can be picked up",
+          });
+        }
         if (shift.assigneeId) {
           throw new TRPCError({ code: "BAD_REQUEST", message: "Shift not open" });
         }
@@ -385,6 +391,17 @@ export const appRouter = router({
           shiftId: shift.id,
           action: "PICKUP_REQUESTED",
           payload: { requestId: pickup.id, locked: true },
+        });
+        const org = await ctx.prisma.orgSettings.findUnique({ where: { id: "default" } });
+        await logAudit(ctx.prisma, {
+          actorId: ctx.userId,
+          shiftId: shift.id,
+          action: "ADMIN_REVIEW_QUEUED",
+          payload: {
+            kind: "pickup",
+            pickupRequestId: pickup.id,
+            adminNotificationEmailConfigured: Boolean(org?.adminNotificationEmail),
+          },
         });
         return pickup;
       }),
@@ -419,6 +436,82 @@ export const appRouter = router({
         });
         return updated;
       }),
+
+    denyPickup: adminProcedure
+      .input(z.object({ requestId: z.string(), note: z.string().min(1) }))
+      .mutation(async ({ ctx, input }) => {
+        const p = await ctx.prisma.pickupRequest.findUniqueOrThrow({
+          where: { id: input.requestId },
+        });
+        if (p.status !== "PENDING") {
+          throw new TRPCError({ code: "BAD_REQUEST", message: "Pickup request is not pending" });
+        }
+        const updated = await ctx.prisma.pickupRequest.update({
+          where: { id: input.requestId },
+          data: {
+            status: "DENIED",
+            resolvedAt: new Date(),
+            resolutionNote: input.note,
+            locksSlot: false,
+          },
+        });
+        await logAudit(ctx.prisma, {
+          actorId: ctx.userId,
+          shiftId: p.shiftId,
+          action: "PICKUP_DENIED",
+          payload: { requestId: p.id, note: input.note },
+        });
+        return updated;
+      }),
+
+    listPendingPickups: adminProcedure.query(async ({ ctx }) => {
+      return ctx.prisma.pickupRequest.findMany({
+        where: { status: "PENDING" },
+        include: {
+          shift: { include: { site: true } },
+          requester: { select: { id: true, name: true, email: true } },
+        },
+        orderBy: { createdAt: "asc" },
+      });
+    }),
+
+    pickupRequestsForShifts: protectedProcedure
+      .input(z.object({ shiftIds: z.array(z.string()) }))
+      .query(async ({ ctx, input }) => {
+        if (input.shiftIds.length === 0) return [];
+        return ctx.prisma.pickupRequest.findMany({
+          where: {
+            shiftId: { in: input.shiftIds },
+            status: "PENDING",
+          },
+          select: { id: true, shiftId: true, requesterId: true },
+        });
+      }),
+
+    myPickupRequests: protectedProcedure.query(async ({ ctx }) => {
+      return ctx.prisma.pickupRequest.findMany({
+        where: { requesterId: ctx.userId },
+        orderBy: { createdAt: "desc" },
+        take: 15,
+        include: { shift: { include: { site: true } } },
+      });
+    }),
+
+    listMySwapRequests: protectedProcedure.query(async ({ ctx }) => {
+      return ctx.prisma.swapRequest.findMany({
+        where: {
+          OR: [{ userAId: ctx.userId }, { userBId: ctx.userId }],
+          status: { in: ["PENDING_COUNTERPARTY", "PENDING_ADMIN", "DENIED"] },
+        },
+        include: {
+          shiftA: { include: { site: true } },
+          shiftB: { include: { site: true } },
+          userA: { select: { id: true, name: true, email: true } },
+          userB: { select: { id: true, name: true, email: true } },
+        },
+        orderBy: { createdAt: "desc" },
+      });
+    }),
 
     requestSwap: protectedProcedure
       .input(
@@ -481,6 +574,17 @@ export const appRouter = router({
           action: "SWAP_COUNTERPARTY_ACCEPTED",
           payload: { swapId: s.id },
         });
+        const org = await ctx.prisma.orgSettings.findUnique({ where: { id: "default" } });
+        await logAudit(ctx.prisma, {
+          actorId: ctx.userId,
+          shiftId: s.shiftAId,
+          action: "ADMIN_REVIEW_QUEUED",
+          payload: {
+            kind: "swap",
+            swapId: s.id,
+            adminNotificationEmailConfigured: Boolean(org?.adminNotificationEmail),
+          },
+        });
         return updated;
       }),
 
@@ -514,6 +618,45 @@ export const appRouter = router({
         });
         return updated;
       }),
+
+    denySwapAdmin: adminProcedure
+      .input(z.object({ swapId: z.string(), note: z.string().min(1) }))
+      .mutation(async ({ ctx, input }) => {
+        const s = await ctx.prisma.swapRequest.findUniqueOrThrow({
+          where: { id: input.swapId },
+        });
+        if (s.status !== "PENDING_ADMIN") {
+          throw new TRPCError({ code: "BAD_REQUEST", message: "Swap is not awaiting admin approval" });
+        }
+        const updated = await ctx.prisma.swapRequest.update({
+          where: { id: input.swapId },
+          data: {
+            status: "DENIED",
+            resolvedAt: new Date(),
+            resolutionNote: input.note,
+          },
+        });
+        await logAudit(ctx.prisma, {
+          actorId: ctx.userId,
+          shiftId: s.shiftAId,
+          action: "SWAP_DENIED",
+          payload: { swapId: s.id, note: input.note },
+        });
+        return updated;
+      }),
+
+    listPendingSwaps: adminProcedure.query(async ({ ctx }) => {
+      return ctx.prisma.swapRequest.findMany({
+        where: { status: "PENDING_ADMIN" },
+        include: {
+          shiftA: { include: { site: true } },
+          shiftB: { include: { site: true } },
+          userA: { select: { id: true, name: true, email: true } },
+          userB: { select: { id: true, name: true, email: true } },
+        },
+        orderBy: { createdAt: "asc" },
+      });
+    }),
 
     createChangeRequest: protectedProcedure
       .input(
