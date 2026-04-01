@@ -100,8 +100,20 @@ export default function AdminPage() {
   const createShift = trpc.shift.create.useMutation();
 
   const isAdmin = me.data?.user.role === "ADMIN";
-  const pendingPickups = trpc.workflow.listPendingPickups.useQuery(undefined, { enabled: isAdmin });
-  const pendingSwaps = trpc.workflow.listPendingSwaps.useQuery(undefined, { enabled: isAdmin });
+  const pendingPickups = trpc.workflow.listPendingPickups.useQuery(undefined, {
+    enabled: isAdmin,
+    refetchInterval: 15_000,
+    refetchOnWindowFocus: true,
+  });
+  const pendingSwaps = trpc.workflow.listPendingSwaps.useQuery(undefined, {
+    enabled: isAdmin,
+    refetchInterval: 15_000,
+    refetchOnWindowFocus: true,
+  });
+
+  const pendingPickupCount = pendingPickups.data?.length ?? 0;
+  const pendingSwapCount = pendingSwaps.data?.length ?? 0;
+  const pendingApprovalTotal = pendingPickupCount + pendingSwapCount;
   const approvePickup = trpc.workflow.approvePickup.useMutation({
     onSuccess: async () => {
       await pendingPickups.refetch();
@@ -163,7 +175,18 @@ export default function AdminPage() {
     <div className="min-h-screen bg-background">
       <header className="flex items-center justify-between border-b border-border px-4 py-4">
         <div>
-          <h1 className="text-2xl font-bold">Admin</h1>
+          <div className="flex flex-wrap items-center gap-2">
+            <h1 className="text-2xl font-bold">Admin</h1>
+            {isAdmin && pendingApprovalTotal > 0 && (
+              <span
+                className="rounded-full bg-primary/15 px-2.5 py-0.5 text-xs font-semibold text-primary"
+                title="Physician shift requests and swaps awaiting your action"
+              >
+                {pendingApprovalTotal} pending{" "}
+                {pendingApprovalTotal === 1 ? "approval" : "approvals"}
+              </span>
+            )}
+          </div>
           <p className="text-sm text-muted-foreground">Create schedules and publish when ready</p>
         </div>
         <div className="flex items-center gap-3">
@@ -214,13 +237,17 @@ export default function AdminPage() {
               <CardHeader>
                 <CardTitle>Pending slot pickups</CardTitle>
                 <CardDescription>
-                  Approve to assign the physician, or reject with a reason. Set{" "}
+                  When a physician books an open shift on the schedule, the request appears here. Approve to assign them,
+                  or reject with a reason. This list refreshes automatically and when you return to this tab. Set{" "}
                   <code className="rounded bg-muted px-1">OrgSettings.adminNotificationEmail</code> in the database for
                   email alerts (wire your provider in production).
                 </CardDescription>
               </CardHeader>
               <CardContent className="space-y-4">
-                {!pendingPickups.data?.length && (
+                {pendingPickups.isLoading && (
+                  <p className="text-sm text-muted-foreground">Loading pickup requests…</p>
+                )}
+                {!pendingPickups.isLoading && !pendingPickups.data?.length && (
                   <p className="text-sm text-muted-foreground">No pending pickup requests.</p>
                 )}
                 {pendingPickups.data?.map((p) => (
@@ -228,12 +255,25 @@ export default function AdminPage() {
                     key={p.id}
                     className="space-y-2 rounded-md border border-border p-3 text-sm"
                   >
+                    <div className="text-xs text-muted-foreground">
+                      Requested{" "}
+                      {new Date(p.createdAt).toLocaleString(undefined, {
+                        dateStyle: "medium",
+                        timeStyle: "short",
+                      })}
+                    </div>
                     <div className="font-medium">{p.requester.name}</div>
                     <div className="text-muted-foreground">{p.requester.email}</div>
                     <div>{p.shift.site.name}</div>
                     <div className="text-muted-foreground">
                       {formatShiftTimeRange(p.shift.startsAt, p.shift.endsAt)}
                     </div>
+                    {p.preferredStartsAt && p.preferredEndsAt && (
+                      <div className="font-medium text-foreground">
+                        Preferred window:{" "}
+                        {formatShiftTimeRange(p.preferredStartsAt, p.preferredEndsAt)}
+                      </div>
+                    )}
                     <div className="flex flex-wrap gap-2 pt-2">
                       <Button
                         type="button"

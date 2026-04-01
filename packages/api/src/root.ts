@@ -351,7 +351,13 @@ export const appRouter = router({
       }),
 
     requestPickup: protectedProcedure
-      .input(z.object({ shiftId: z.string() }))
+      .input(
+        z.object({
+          shiftId: z.string(),
+          preferredStartsAt: z.coerce.date().optional(),
+          preferredEndsAt: z.coerce.date().optional(),
+        }),
+      )
       .mutation(async ({ ctx, input }) => {
         const shift = await ctx.prisma.shift.findUniqueOrThrow({
           where: { id: input.shiftId },
@@ -364,6 +370,33 @@ export const appRouter = router({
         }
         if (shift.assigneeId) {
           throw new TRPCError({ code: "BAD_REQUEST", message: "Shift not open" });
+        }
+        let preferredStartsAt: Date | undefined;
+        let preferredEndsAt: Date | undefined;
+        if (input.preferredStartsAt && input.preferredEndsAt) {
+          preferredStartsAt = input.preferredStartsAt;
+          preferredEndsAt = input.preferredEndsAt;
+          if (preferredStartsAt < shift.startsAt || preferredEndsAt > shift.endsAt) {
+            throw new TRPCError({
+              code: "BAD_REQUEST",
+              message: "Preferred times must fall within the shift",
+            });
+          }
+          if (preferredEndsAt.getTime() <= preferredStartsAt.getTime()) {
+            throw new TRPCError({ code: "BAD_REQUEST", message: "Invalid preferred time range" });
+          }
+          const durMin = (preferredEndsAt.getTime() - preferredStartsAt.getTime()) / 60000;
+          if (durMin < 15 || durMin > 30) {
+            throw new TRPCError({
+              code: "BAD_REQUEST",
+              message: "Preferred slot must be between 15 and 30 minutes",
+            });
+          }
+        } else if (input.preferredStartsAt ?? input.preferredEndsAt) {
+          throw new TRPCError({
+            code: "BAD_REQUEST",
+            message: "Provide both preferred start and end, or neither",
+          });
         }
         const existingLock = await ctx.prisma.pickupRequest.findFirst({
           where: {
@@ -384,6 +417,8 @@ export const appRouter = router({
             requesterId: ctx.userId,
             status: "PENDING",
             locksSlot: true,
+            preferredStartsAt,
+            preferredEndsAt,
           },
         });
         await logAudit(ctx.prisma, {

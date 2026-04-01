@@ -8,7 +8,13 @@ import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
-import { WeekTimeline, formatShiftTimeRange, type TimelineShift } from "@/components/week-timeline";
+import {
+  WeekTimeline,
+  formatShiftTimeRange,
+  type SlotPick,
+  type SlotStepMinutes,
+  type TimelineShift,
+} from "@/components/week-timeline";
 
 function startOfWeekMonday(d: Date) {
   const x = new Date(d);
@@ -39,7 +45,11 @@ export default function SchedulePage() {
   const syncedRef = useRef(false);
 
   const [weekAnchor, setWeekAnchor] = useState(() => startOfWeekMonday(new Date()));
-  const [selected, setSelected] = useState<TimelineShift | null>(null);
+  const [slotStepMinutes, setSlotStepMinutes] = useState<SlotStepMinutes>(15);
+  /** Visible calendar window (hours). Shifts are clipped to this range instead of stretching the grid. */
+  const [visibleStartHour, setVisibleStartHour] = useState(6);
+  const [visibleEndHour, setVisibleEndHour] = useState(20);
+  const [selected, setSelected] = useState<{ shift: TimelineShift; slot: SlotPick } | null>(null);
   const [swapTargetId, setSwapTargetId] = useState("");
 
   const range = useMemo(() => {
@@ -50,7 +60,28 @@ export default function SchedulePage() {
 
   const utils = trpc.useUtils();
   const versions = trpc.schedule.listVersions.useQuery();
-  const activeVersionId = versions.data?.[0]?.id;
+  /** Prefer latest published year so open shifts are PUBLISHED and bookable; else fall back to newest row. */
+  const activeVersionId = useMemo(() => {
+    const list = versions.data;
+    if (!list?.length) return undefined;
+    const published = list.filter((v) => v.status === "PUBLISHED");
+    if (published.length > 0) {
+      return published.reduce((best, cur) => (cur.year > best.year ? cur : best)).id;
+    }
+    return list[0]!.id;
+  }, [versions.data]);
+
+  const bookingDialogRef = useRef<HTMLDialogElement>(null);
+
+  useEffect(() => {
+    const d = bookingDialogRef.current;
+    if (!d) return;
+    if (selected) {
+      if (!d.open) d.showModal();
+    } else if (d.open) {
+      d.close();
+    }
+  }, [selected]);
 
   const shifts = trpc.shift.list.useQuery(
     {
@@ -80,6 +111,7 @@ export default function SchedulePage() {
     onSuccess: async () => {
       await utils.workflow.pickupRequestsForShifts.invalidate();
       await utils.workflow.myPickupRequests.invalidate();
+      await utils.workflow.listPendingPickups.invalidate();
       await utils.shift.list.invalidate();
       setSelected(null);
     },
@@ -142,12 +174,12 @@ export default function SchedulePage() {
 
   const swapOptions = useMemo(() => {
     if (!selected || !timelineShifts || !me.data?.user.id) return [];
-    const uid = me.data.user.id;
+    const myId = me.data.user.id;
     return timelineShifts.filter(
       (s) =>
-        s.id !== selected.id &&
+        s.id !== selected.shift.id &&
         s.assignee?.id &&
-        s.assignee.id !== uid,
+        s.assignee.id !== myId,
     );
   }, [selected, timelineShifts, me.data?.user.id]);
 
@@ -158,7 +190,9 @@ export default function SchedulePage() {
       <header className="flex items-center justify-between border-b border-border px-4 py-4">
         <div>
           <h1 className="text-2xl font-bold">My schedule</h1>
-          <p className="text-sm text-muted-foreground">Week view · tap an open slot or your shift</p>
+          <p className="text-sm text-muted-foreground">
+            Week view · tap an open slot to book it, or your shift to request a swap
+          </p>
         </div>
         <div className="flex items-center gap-3">
           <Button asChild variant="outline">
@@ -201,6 +235,73 @@ export default function SchedulePage() {
                 Next week
               </Button>
             </div>
+            <div className="space-y-2 pt-2">
+              <Label>Slot size (click targets)</Label>
+              <div className="flex flex-wrap gap-2">
+                <Button
+                  type="button"
+                  size="sm"
+                  variant={slotStepMinutes === 15 ? "default" : "outline"}
+                  onClick={() => setSlotStepMinutes(15)}
+                >
+                  15 minutes
+                </Button>
+                <Button
+                  type="button"
+                  size="sm"
+                  variant={slotStepMinutes === 30 ? "default" : "outline"}
+                  onClick={() => setSlotStepMinutes(30)}
+                >
+                  30 minutes
+                </Button>
+              </div>
+              <p className="text-xs text-muted-foreground">
+                Open published shifts are split into tiles. Pickup requests can include a 15–30 minute preferred
+                window when you choose a tile.
+              </p>
+            </div>
+            <div className="grid gap-4 sm:grid-cols-2">
+              <div className="space-y-2">
+                <Label htmlFor="vh0">Day starts at (hour)</Label>
+                <Input
+                  id="vh0"
+                  type="number"
+                  min={0}
+                  max={22}
+                  className="w-32"
+                  value={visibleStartHour}
+                  onChange={(e) => {
+                    const v = Number(e.target.value);
+                    if (Number.isNaN(v)) return;
+                    const s = Math.max(0, Math.min(22, v));
+                    setVisibleStartHour(s);
+                    if (visibleEndHour <= s) setVisibleEndHour(Math.min(24, s + 1));
+                  }}
+                />
+              </div>
+              <div className="space-y-2">
+                <Label htmlFor="vh1">Day ends at (hour)</Label>
+                <Input
+                  id="vh1"
+                  type="number"
+                  min={1}
+                  max={24}
+                  className="w-32"
+                  value={visibleEndHour}
+                  onChange={(e) => {
+                    const v = Number(e.target.value);
+                    if (Number.isNaN(v)) return;
+                    const end = Math.max(1, Math.min(24, v));
+                    setVisibleEndHour(end);
+                    if (end <= visibleStartHour) setVisibleStartHour(Math.max(0, end - 1));
+                  }}
+                />
+              </div>
+            </div>
+            <p className="text-xs text-muted-foreground">
+              Each day is a full 0:00–24:00 column; times outside this window are shaded as blocked. Pickup tiles only
+              appear in the open window; long shifts are clipped there while full times stay in details and requests.
+            </p>
           </CardContent>
         </Card>
 
@@ -311,85 +412,124 @@ export default function SchedulePage() {
             shifts={timelineShifts}
             currentUserId={uid}
             pendingPickups={pendingPickups.data ?? []}
-            onShiftClick={(s) => setSelected(s)}
+            slotStepMinutes={slotStepMinutes}
+            visibleStartHour={visibleStartHour}
+            visibleEndHour={visibleEndHour}
+            onSlotClick={(shift, slot) => setSelected({ shift, slot })}
           />
         )}
 
-        {selected && uid && (
-          <Card>
-            <CardHeader>
-              <CardTitle>Slot actions</CardTitle>
-              <CardDescription>
-                {selected.site.name} · {formatShiftTimeRange(selected.startsAt, selected.endsAt)}
-              </CardDescription>
-            </CardHeader>
-            <CardContent className="space-y-4">
-              {!selected.assignee && selected.status === "PUBLISHED" && (
-                <div className="space-y-2">
-                  <p className="text-sm text-muted-foreground">
-                    Request this open slot. An admin must approve before it appears on your schedule.
-                  </p>
-                  <Button
-                    type="button"
-                    onClick={() => requestPickup.mutate({ shiftId: selected.id })}
-                    disabled={requestPickup.isPending}
-                  >
-                    {requestPickup.isPending ? "Submitting…" : "Request pickup"}
-                  </Button>
-                </div>
-              )}
+        <dialog
+          ref={bookingDialogRef}
+          onClose={() => setSelected(null)}
+          onClick={(e) => {
+            if (e.target === bookingDialogRef.current) setSelected(null);
+          }}
+          className="fixed left-1/2 top-1/2 z-50 w-[min(100vw-2rem,28rem)] max-h-[min(90vh,640px)] -translate-x-1/2 -translate-y-1/2 overflow-y-auto rounded-xl border border-border bg-card p-0 text-foreground shadow-lg backdrop:bg-black/50"
+        >
+          {selected && (
+            <div className="p-6">
+              <h2 className="text-lg font-semibold">
+                {uid && selected.shift.assignee?.id === uid
+                  ? "Request swap"
+                  : !selected.shift.assignee && selected.shift.status === "PUBLISHED"
+                    ? "Book shift"
+                    : "Slot"}
+              </h2>
+              <p className="mt-1 text-sm text-muted-foreground">
+                {selected.shift.site.name} · {formatShiftTimeRange(selected.shift.startsAt, selected.shift.endsAt)}
+              </p>
+              <p className="mt-2 text-sm text-muted-foreground">
+                Selected slot: {formatShiftTimeRange(selected.slot.slotStart, selected.slot.slotEnd)}
+              </p>
 
-              {selected.assignee?.id === uid && (
-                <div className="space-y-3">
-                  <p className="text-sm text-muted-foreground">
-                    Propose a swap with a colleague&apos;s assigned shift this week. They must accept, then an admin
-                    approves.
-                  </p>
-                  <div className="space-y-2">
-                    <Label htmlFor="swapWith">Swap with (their shift)</Label>
-                    <select
-                      id="swapWith"
-                      className="flex h-11 w-full rounded-md border border-border bg-background px-3 text-sm"
-                      value={swapTargetId}
-                      onChange={(e) => setSwapTargetId(e.target.value)}
+              <div className="mt-5 space-y-4">
+                {!selected.shift.assignee && selected.shift.status === "PUBLISHED" && (
+                  <div className="space-y-3">
+                    <p className="text-sm text-muted-foreground">
+                      Your booking request goes to an admin for approval. When approved, this shift appears on your
+                      schedule. If this tile is 15–30 minutes, that window is included in the request.
+                    </p>
+                    <Button
+                      type="button"
+                      className="w-full sm:w-auto"
+                      onClick={() => {
+                        const durMin =
+                          (selected.slot.slotEnd.getTime() - selected.slot.slotStart.getTime()) / 60000;
+                        const payload: { shiftId: string; preferredStartsAt?: Date; preferredEndsAt?: Date } = {
+                          shiftId: selected.shift.id,
+                        };
+                        if (durMin >= 15 && durMin <= 30) {
+                          payload.preferredStartsAt = selected.slot.slotStart;
+                          payload.preferredEndsAt = selected.slot.slotEnd;
+                        }
+                        requestPickup.mutate(payload);
+                      }}
+                      disabled={requestPickup.isPending || !uid}
                     >
-                      <option value="">Select shift…</option>
-                      {swapOptions.map((s) => (
-                        <option key={s.id} value={s.id}>
-                          {s.site.name} · {s.assignee?.name} · {formatShiftTimeRange(s.startsAt, s.endsAt)}
-                        </option>
-                      ))}
-                    </select>
+                      {requestPickup.isPending ? "Submitting…" : "Book shift"}
+                    </Button>
+                    {!uid && (
+                      <p className="text-xs text-amber-700 dark:text-amber-300">
+                        Finish signing in and profile sync before booking.
+                      </p>
+                    )}
                   </div>
-                  <Button
-                    type="button"
-                    disabled={!swapTargetId || requestSwap.isPending}
-                    onClick={() => {
-                      const other = timelineShifts?.find((x) => x.id === swapTargetId);
-                      const otherAssignee = other?.assignee?.id;
-                      if (!otherAssignee) return;
-                      requestSwap.mutate({
-                        myShiftId: selected.id,
-                        theirShiftId: swapTargetId,
-                        counterpartyId: otherAssignee,
-                      });
-                    }}
-                  >
-                    {requestSwap.isPending ? "Sending…" : "Request swap"}
-                  </Button>
-                </div>
-              )}
+                )}
 
-              {selected.assignee && selected.assignee.id !== uid && (
-                <p className="text-sm text-muted-foreground">This slot is assigned to someone else.</p>
-              )}
+                {uid && selected.shift.assignee?.id === uid && (
+                  <div className="space-y-3">
+                    <p className="text-sm text-muted-foreground">
+                      Propose a swap with a colleague&apos;s assigned shift this week. They must accept, then an admin
+                      approves. The swap applies to the full shifts, not only this tile.
+                    </p>
+                    <div className="space-y-2">
+                      <Label htmlFor="swapWith">Swap with (their shift)</Label>
+                      <select
+                        id="swapWith"
+                        className="flex h-11 w-full rounded-md border border-border bg-background px-3 text-sm"
+                        value={swapTargetId}
+                        onChange={(e) => setSwapTargetId(e.target.value)}
+                      >
+                        <option value="">Select shift…</option>
+                        {swapOptions.map((s) => (
+                          <option key={s.id} value={s.id}>
+                            {s.site.name} · {s.assignee?.name} · {formatShiftTimeRange(s.startsAt, s.endsAt)}
+                          </option>
+                        ))}
+                      </select>
+                    </div>
+                    <Button
+                      type="button"
+                      className="w-full sm:w-auto"
+                      disabled={!swapTargetId || requestSwap.isPending}
+                      onClick={() => {
+                        const other = timelineShifts?.find((x) => x.id === swapTargetId);
+                        const otherAssignee = other?.assignee?.id;
+                        if (!otherAssignee) return;
+                        requestSwap.mutate({
+                          myShiftId: selected.shift.id,
+                          theirShiftId: swapTargetId,
+                          counterpartyId: otherAssignee,
+                        });
+                      }}
+                    >
+                      {requestSwap.isPending ? "Sending…" : "Request swap"}
+                    </Button>
+                  </div>
+                )}
 
-              <Button type="button" variant="outline" onClick={() => setSelected(null)}>
-                Close
-              </Button>
-            </CardContent>
-          </Card>
-        )}
+                {uid && selected.shift.assignee && selected.shift.assignee.id !== uid && (
+                  <p className="text-sm text-muted-foreground">This slot is assigned to someone else.</p>
+                )}
+
+                <Button type="button" variant="outline" className="w-full sm:w-auto" onClick={() => setSelected(null)}>
+                  Cancel
+                </Button>
+              </div>
+            </div>
+          )}
+        </dialog>
 
         {me.data?.user && (
           <p className="text-sm text-muted-foreground">

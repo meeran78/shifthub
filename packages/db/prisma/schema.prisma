@@ -175,6 +175,9 @@ model PickupRequest {
   resolvedAt     DateTime?
   /// Admin explanation when pickup is denied (required on deny)
   resolutionNote String?
+  /// Physician-selected window within the shift (optional; min 15 min when set)
+  preferredStartsAt DateTime?
+  preferredEndsAt   DateTime?
 
   @@index([shiftId, status])
 }
