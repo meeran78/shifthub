@@ -1,11 +1,11 @@
 "use client";
 
-import { useMemo } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { cn } from "@/lib/utils";
 
 const DEFAULT_DAY_START = 6;
 const DEFAULT_DAY_END = 20;
-/** Calendar column spans full local day (0:00–24:00); hours outside [visibleStart, visibleEnd) are visually blocked. */
+/** Calendar column spans a full local day (0:00–24:00); hours outside the per-day window are visually blocked. */
 const HOURS_IN_DAY = 24;
 const PX_PER_MINUTE = 1.2;
 /** Visual grid every 15 minutes */
@@ -25,6 +25,9 @@ export type SlotPick = { slotStart: Date; slotEnd: Date };
 export type PendingPickup = { id: string; shiftId: string; requesterId: string };
 
 export type SlotStepMinutes = 15 | 30;
+
+/** Per-day visible window, indexed 0..6 from `weekStart` (Monday-first if weekStart is a Monday). */
+export type DayWindow = { start: number; end: number };
 
 /** Split a day segment into pickable slots (15 or 30 min); merges trailing &lt;15 min into previous */
 export function iterSlotSegments(
@@ -99,6 +102,14 @@ function endOfDay(d: Date) {
   return x;
 }
 
+function isSameDay(a: Date, b: Date) {
+  return (
+    a.getFullYear() === b.getFullYear() &&
+    a.getMonth() === b.getMonth() &&
+    a.getDate() === b.getDate()
+  );
+}
+
 /** Visible portion of a shift on a given calendar day (local), before visible-hour window clip */
 function segmentForDay(
   s: TimelineShift,
@@ -114,7 +125,7 @@ function segmentForDay(
   return { segStart, segEnd };
 }
 
-/** Intersect [segStart, segEnd] with the fixed daily visible window [startHour, endHour] */
+/** Intersect [segStart, segEnd] with the visible window [startHour, endHour] for `day`. */
 function clipSegmentToVisibleHours(
   seg: { segStart: Date; segEnd: Date },
   day: Date,
@@ -133,7 +144,6 @@ function clipSegmentToVisibleHours(
   return { segStart: new Date(s), segEnd: new Date(e) };
 }
 
-/** Earliest start and latest end among segments actually shown in the visible window */
 function dayScheduleSpan(
   day: Date,
   shifts: TimelineShift[],
@@ -164,36 +174,30 @@ function minutesFromMidnight(day: Date, t: Date) {
   return (t.getTime() - sod.getTime()) / 60000;
 }
 
-/** Optional: expand grid from shift times (can stretch to full day for long shifts). Default: fixed window. */
-function deriveDayBoundsFromShifts(shifts: TimelineShift[]): { minHour: number; maxHour: number } {
-  let minH = DEFAULT_DAY_START;
-  let maxH = DEFAULT_DAY_END;
-  for (const s of shifts) {
-    const start = toDate(s.startsAt);
-    const end = toDate(s.endsAt);
-    minH = Math.min(minH, start.getHours() + start.getMinutes() / 60);
-    maxH = Math.max(maxH, end.getHours() + end.getMinutes() / 60 + (end.getSeconds() > 0 || end.getMilliseconds() > 0 ? 0.01 : 0));
-  }
-  minH = Math.max(0, Math.floor(minH) - 1);
-  maxH = Math.min(24, Math.ceil(maxH) + 1);
-  if (maxH <= minH) {
-    return { minHour: DEFAULT_DAY_START, maxHour: DEFAULT_DAY_END };
-  }
-  return { minHour: minH, maxHour: maxH };
+function clampHour(h: number, min: number, max: number) {
+  if (Number.isNaN(h)) return min;
+  return Math.max(min, Math.min(max, Math.floor(h)));
 }
 
-function normalizeVisibleHours(
-  start: number | undefined,
-  end: number | undefined,
-): { minHour: number; maxHour: number } {
-  let minH = Math.floor(start ?? DEFAULT_DAY_START);
-  let maxH = Math.floor(end ?? DEFAULT_DAY_END);
-  minH = Math.max(0, Math.min(23, minH));
-  maxH = Math.max(1, Math.min(24, maxH));
-  if (maxH <= minH) {
-    maxH = Math.min(24, minH + 1);
-  }
-  return { minHour: minH, maxHour: maxH };
+function normalizeWindow(start: number | undefined, end: number | undefined): DayWindow {
+  let s = clampHour(start ?? DEFAULT_DAY_START, 0, 23);
+  let e = clampHour(end ?? DEFAULT_DAY_END, 1, 24);
+  if (e <= s) e = Math.min(24, s + 1);
+  return { start: s, end: e };
+}
+
+function snapMinutes(minutes: number, step: number) {
+  return Math.round(minutes / step) * step;
+}
+
+function dateAtMinutes(day: Date, minutes: number) {
+  const d = startOfDay(day);
+  d.setMinutes(d.getMinutes() + minutes);
+  return d;
+}
+
+function shiftCoversDay(shift: TimelineShift, day: Date) {
+  return Boolean(segmentForDay(shift, day));
 }
 
 export function WeekTimeline({
@@ -209,43 +213,62 @@ export function WeekTimeline({
   visibleStartHour = DEFAULT_DAY_START,
   /** Bottom of the grid (hour 1–24, must be &gt; visibleStartHour). */
   visibleEndHour = DEFAULT_DAY_END,
-  /** If true, min/max hours follow shift data (old behavior; long shifts expand the calendar). */
-  deriveBoundsFromShifts = false,
+  /** Per-weekday windows (length 7, indexed from `weekStart`). Overrides visibleStart/EndHour when present. */
+  visibleHoursByDay,
+  /** Optional: override "now" (testing/demo). When unset, ticks every minute. */
+  currentTime,
+  /** Show a horizontal indicator on today's column at the current time. Default: true. */
+  showNowLine = true,
+  /** Admin editing: enables drag-to-create on background and resize handles on tiles. */
+  canEdit = false,
+  /** Site picker context for drag-create. Required when `onCreate` is provided. */
+  defaultCreateSiteId,
+  /** Drag-create handler. Called once when the user releases a background drag. */
+  onCreate,
+  /** Resize handler — fires on release after dragging a tile's bottom grip. */
+  onResize,
+  /** Number of day columns to render starting at `weekStart`. Defaults to 7 (week view). Use 1 for day view. */
+  daysToShow = 7,
 }: {
   weekStart: Date;
   shifts: TimelineShift[];
   className?: string;
   currentUserId?: string | null;
   pendingPickups?: PendingPickup[];
-  /** Pickable slot size (15 or 30 minutes per tile) */
   slotStepMinutes?: SlotStepMinutes;
-  /** Preferred: click passes exact slot window (use for pickup / swap context) */
   onSlotClick?: (shift: TimelineShift, slot: SlotPick) => void;
-  /** Fallback when onSlotClick not provided */
   onShiftClick?: (shift: TimelineShift) => void;
   visibleStartHour?: number;
   visibleEndHour?: number;
-  deriveBoundsFromShifts?: boolean;
+  visibleHoursByDay?: DayWindow[];
+  currentTime?: Date;
+  showNowLine?: boolean;
+  canEdit?: boolean;
+  defaultCreateSiteId?: string;
+  onCreate?: (input: { day: Date; startsAt: Date; endsAt: Date; siteId?: string }) => void;
+  onResize?: (input: { shift: TimelineShift; endsAt: Date }) => void;
+  daysToShow?: number;
 }) {
-  const { minHour, maxHour } = useMemo(() => {
-    if (deriveBoundsFromShifts) {
-      return deriveDayBoundsFromShifts(shifts);
-    }
-    return normalizeVisibleHours(visibleStartHour, visibleEndHour);
-  }, [deriveBoundsFromShifts, shifts, visibleStartHour, visibleEndHour]);
   const fullDayMinutes = HOURS_IN_DAY * 60;
   const gridHeight = fullDayMinutes * PX_PER_MINUTE;
-  const blockedTopPx = minHour * 60 * PX_PER_MINUTE;
-  const blockedBottomPx = (HOURS_IN_DAY - maxHour) * 60 * PX_PER_MINUTE;
+  const dayCount = Math.max(1, Math.min(7, Math.floor(daysToShow)));
 
   const days = useMemo(() => {
     const start = startOfDay(weekStart);
-    return Array.from({ length: 7 }, (_, i) => {
+    return Array.from({ length: dayCount }, (_, i) => {
       const d = new Date(start);
       d.setDate(d.getDate() + i);
       return d;
     });
-  }, [weekStart]);
+  }, [weekStart, dayCount]);
+
+  const dayWindows = useMemo<DayWindow[]>(() => {
+    return days.map((_, i) => {
+      const override = visibleHoursByDay?.[i];
+      if (override) return normalizeWindow(override.start, override.end);
+      return normalizeWindow(visibleStartHour, visibleEndHour);
+    });
+  }, [days, visibleHoursByDay, visibleStartHour, visibleEndHour]);
 
   const pendingByShift = useMemo(() => {
     const m = new Map<string, PendingPickup[]>();
@@ -256,6 +279,18 @@ export function WeekTimeline({
     }
     return m;
   }, [pendingPickups]);
+
+  // self-ticking "now" so the indicator follows the clock without re-renders elsewhere
+  const [tickedNow, setTickedNow] = useState<Date>(() => currentTime ?? new Date());
+  useEffect(() => {
+    if (currentTime) {
+      setTickedNow(currentTime);
+      return;
+    }
+    const id = setInterval(() => setTickedNow(new Date()), 60_000);
+    return () => clearInterval(id);
+  }, [currentTime]);
+  const now = currentTime ?? tickedNow;
 
   const handleActivate = (s: TimelineShift, slot: SlotPick) => {
     if (onSlotClick) {
@@ -268,16 +303,17 @@ export function WeekTimeline({
   return (
     <div className={cn("rounded-xl border border-border bg-card", className)}>
       <div className="max-h-[min(80vh,1200px)] overflow-auto">
-        <div className="flex min-w-[960px]">
+        <div
+          className="flex"
+          style={{ minWidth: dayCount === 1 ? 320 : Math.max(640, 64 + dayCount * 140) }}
+        >
           <div
             className="w-16 flex-shrink-0 border-r border-border text-xs text-muted-foreground"
             style={{ minHeight: gridHeight + 52 }}
           >
             <div className="sticky top-0 z-20 space-y-0.5 bg-card/95 px-1 py-2 text-center backdrop-blur">
               <div className="text-[10px] font-semibold text-foreground">Time</div>
-              <div className="tabular-nums text-[10px] font-medium leading-tight">
-                Open {minHour}:00–{maxHour}:00
-              </div>
+              <div className="tabular-nums text-[10px] font-medium leading-tight">0:00–24:00</div>
             </div>
             {Array.from({ length: HOURS_IN_DAY }, (_, h) => (
               <div
@@ -289,157 +325,397 @@ export function WeekTimeline({
               </div>
             ))}
           </div>
-          {days.map((day) => {
-            const daySpan = dayScheduleSpan(day, shifts, minHour, maxHour);
+          {days.map((day, dayIdx) => {
+            const dw = dayWindows[dayIdx]!;
+            const daySpan = dayScheduleSpan(day, shifts, dw.start, dw.end);
+            const dayShifts = shifts.filter((s) => shiftCoversDay(s, day));
             return (
-            <div key={day.toISOString()} className="relative min-w-0 flex-1 border-l border-border">
-              <div className="sticky top-0 z-20 space-y-0.5 bg-card/95 px-2 py-2 text-center backdrop-blur">
-                <div className="text-sm font-semibold">
-                  {day.toLocaleDateString(undefined, { weekday: "short", month: "short", day: "numeric" })}
-                </div>
-                <div className="text-xs font-medium tabular-nums text-muted-foreground">
-                  {daySpan ? (
-                    <>
-                      {formatClock(daySpan.start)} – {formatClock(daySpan.end)}
-                    </>
-                  ) : (
-                    <span className="text-muted-foreground/80">No shifts</span>
-                  )}
-                </div>
-              </div>
-              <div className="relative isolate" style={{ height: gridHeight }}>
-                {/* Blocked: before visible start / after visible end (each local day) */}
-                <div
-                  className="pointer-events-none absolute inset-x-0 top-0 z-[5] border-b border-dashed border-border/50 bg-muted/50"
-                  style={{ height: blockedTopPx }}
-                  aria-hidden
-                />
-                <div
-                  className="pointer-events-none absolute inset-x-0 bottom-0 z-[5] border-t border-dashed border-border/50 bg-muted/50"
-                  style={{ height: blockedBottomPx }}
-                  aria-hidden
-                />
-                {/* Hour lines — full day */}
-                {Array.from({ length: HOURS_IN_DAY }, (_, h) => (
-                  <div
-                    key={`h-${h}`}
-                    className="pointer-events-none absolute left-0 right-0 border-t border-border/40"
-                    style={{ top: h * 60 * PX_PER_MINUTE }}
-                  />
-                ))}
-                {/* 15-minute sub-grid */}
-                {Array.from({ length: Math.ceil(fullDayMinutes / SUBGRID_MINUTES) }, (_, i) => {
-                  const m = i * SUBGRID_MINUTES;
-                  if (m === 0 || m % 60 === 0) return null;
-                  return (
-                    <div
-                      key={`sub-${i}`}
-                      className="pointer-events-none absolute left-0 right-0 border-t border-border/20"
-                      style={{ top: m * PX_PER_MINUTE }}
-                    />
-                  );
-                })}
-                {shifts.flatMap((s) => {
-                  const raw = segmentForDay(s, day);
-                  if (!raw) return [];
-                  const seg = clipSegmentToVisibleHours(raw, day, minHour, maxHour);
-                  if (!seg) return [];
-                  const slots = iterSlotSegments(seg.segStart, seg.segEnd, slotStepMinutes);
-
-                  const assigneeId = s.assignee?.id;
-                  const isOpen = !assigneeId;
-                  const isMine = Boolean(currentUserId && assigneeId === currentUserId);
-                  const pend = pendingByShift.get(s.id) ?? [];
-                  const myPending = currentUserId ? pend.some((p) => p.requesterId === currentUserId) : false;
-                  const otherPending = pend.some((p) => p.requesterId !== currentUserId);
-
-                  const canPickOpen = isOpen && s.status === "PUBLISHED";
-                  const canSwapMine = isMine;
-                  const hasHandler = Boolean(onSlotClick || onShiftClick);
-                  const canInteract = hasHandler && (canPickOpen || canSwapMine);
-
-                  return slots.map((slot, slotIdx) => {
-                    const startMin = minutesFromMidnight(day, slot.slotStart);
-                    const endMin = minutesFromMidnight(day, slot.slotEnd);
-                    const top = Math.max(0, startMin * PX_PER_MINUTE);
-                    const height = Math.max(28, (endMin - startMin) * PX_PER_MINUTE);
-
-                    const timeLine = `${toDate(slot.slotStart).toLocaleTimeString(undefined, {
-                      hour: "numeric",
-                      minute: "2-digit",
-                    })} – ${toDate(slot.slotEnd).toLocaleTimeString(undefined, {
-                      hour: "numeric",
-                      minute: "2-digit",
-                    })}`;
-
-                    // Stacking: later tiles draw above; interactive above non-interactive (avoid disabled-button quirks)
-                    const stackKey = Math.round(top * 100) + slotIdx;
-                    const z = canInteract ? 40 + (stackKey % 50) : 10 + (stackKey % 20);
-
-                    return (
-                      <button
-                        key={`${s.id}-${day.toISOString()}-${slotIdx}`}
-                        type="button"
-                        aria-disabled={!canInteract}
-                        tabIndex={canInteract ? 0 : -1}
-                        onClick={(e) => {
-                          e.stopPropagation();
-                          if (!canInteract) return;
-                          handleActivate(s, slot);
-                        }}
-                        className={cn(
-                          "absolute left-1 right-1 overflow-hidden rounded border px-1.5 py-0.5 text-left text-[10px] shadow-sm transition",
-                          "focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring",
-                          canInteract && "cursor-pointer hover:opacity-95 active:opacity-100",
-                          !canInteract && "cursor-default opacity-80",
-                          !canInteract && "pointer-events-none",
-                          canPickOpen && s.status === "PUBLISHED" && "border-dashed",
-                          myPending && "ring-2 ring-amber-400/80",
-                        )}
-                        style={{
-                          top,
-                          height,
-                          zIndex: z,
-                          backgroundColor: `${s.site.colorHex}22`,
-                          borderLeftWidth: 3,
-                          borderLeftColor: s.site.colorHex,
-                        }}
-                        title={
-                          canInteract
-                            ? canPickOpen
-                              ? `${s.site.name} — ${timeLine} (click to book)`
-                              : `${s.site.name} — ${timeLine} (click)`
-                            : `${s.site.name} — ${timeLine}`
-                        }
-                      >
-                        <div className="truncate font-semibold leading-tight" style={{ color: s.site.colorHex }}>
-                          {s.site.name}
-                        </div>
-                        <div className="truncate text-[9px] text-muted-foreground">
-                          {canPickOpen ? (
-                            <span>Open</span>
-                          ) : isMine ? (
-                            <span>You</span>
-                          ) : (
-                            <span>{s.assignee?.name ?? "—"}</span>
-                          )}
-                          {myPending && (
-                            <span className="ml-0.5 font-medium text-amber-700 dark:text-amber-300">· Pending</span>
-                          )}
-                          {!myPending && otherPending && (
-                            <span className="ml-0.5 font-medium text-amber-700 dark:text-amber-300">· Review</span>
-                          )}
-                        </div>
-                        <div className="tabular-nums text-[9px] font-medium text-foreground">{timeLine}</div>
-                      </button>
-                    );
-                  });
-                })}
-              </div>
-            </div>
+              <DayColumn
+                key={day.toISOString()}
+                day={day}
+                window={dw}
+                shifts={dayShifts}
+                pendingByShift={pendingByShift}
+                slotStepMinutes={slotStepMinutes}
+                onActivate={handleActivate}
+                onSlotClick={onSlotClick}
+                onShiftClick={onShiftClick}
+                currentUserId={currentUserId ?? null}
+                gridHeight={gridHeight}
+                fullDayMinutes={fullDayMinutes}
+                daySpan={daySpan}
+                now={now}
+                showNowLine={showNowLine}
+                canEdit={canEdit}
+                defaultCreateSiteId={defaultCreateSiteId}
+                onCreate={onCreate}
+                onResize={onResize}
+              />
             );
           })}
         </div>
+      </div>
+    </div>
+  );
+}
+
+function DayColumn({
+  day,
+  window: dw,
+  shifts,
+  pendingByShift,
+  slotStepMinutes,
+  onActivate,
+  onSlotClick,
+  onShiftClick,
+  currentUserId,
+  gridHeight,
+  fullDayMinutes,
+  daySpan,
+  now,
+  showNowLine,
+  canEdit,
+  defaultCreateSiteId,
+  onCreate,
+  onResize,
+}: {
+  day: Date;
+  window: DayWindow;
+  shifts: TimelineShift[];
+  pendingByShift: Map<string, PendingPickup[]>;
+  slotStepMinutes: SlotStepMinutes;
+  onActivate: (s: TimelineShift, slot: SlotPick) => void;
+  onSlotClick?: (shift: TimelineShift, slot: SlotPick) => void;
+  onShiftClick?: (shift: TimelineShift) => void;
+  currentUserId: string | null;
+  gridHeight: number;
+  fullDayMinutes: number;
+  daySpan: { start: Date; end: Date } | null;
+  now: Date;
+  showNowLine: boolean;
+  canEdit: boolean;
+  defaultCreateSiteId?: string;
+  onCreate?: (input: { day: Date; startsAt: Date; endsAt: Date; siteId?: string }) => void;
+  onResize?: (input: { shift: TimelineShift; endsAt: Date }) => void;
+}) {
+  const blockedTopPx = dw.start * 60 * PX_PER_MINUTE;
+  const blockedBottomPx = (HOURS_IN_DAY - dw.end) * 60 * PX_PER_MINUTE;
+  const surfaceRef = useRef<HTMLDivElement>(null);
+  const [ghost, setGhost] = useState<{ topMin: number; bottomMin: number } | null>(null);
+  const [resize, setResize] = useState<{ shiftId: string; endMin: number } | null>(null);
+
+  const isToday = isSameDay(now, day);
+  const nowMin = isToday ? minutesFromMidnight(day, now) : null;
+  const showNow = showNowLine && nowMin != null && nowMin >= dw.start * 60 && nowMin <= dw.end * 60;
+
+  const canCreate = canEdit && Boolean(onCreate);
+  const canResize = canEdit && Boolean(onResize);
+
+  function pixelsToMinutes(yPx: number) {
+    return Math.max(0, Math.min(fullDayMinutes, yPx / PX_PER_MINUTE));
+  }
+
+  function clampToWindow(min: number) {
+    return Math.max(dw.start * 60, Math.min(dw.end * 60, min));
+  }
+
+  function handleBackgroundPointerDown(e: React.PointerEvent<HTMLDivElement>) {
+    if (!canCreate) return;
+    if (e.button !== 0) return;
+    if (e.target !== e.currentTarget) return; // ignore presses that started on a tile/handle
+    const rect = surfaceRef.current?.getBoundingClientRect();
+    if (!rect) return;
+    const startMin = clampToWindow(snapMinutes(pixelsToMinutes(e.clientY - rect.top), SUBGRID_MINUTES));
+    setGhost({ topMin: startMin, bottomMin: startMin + SUBGRID_MINUTES });
+    (e.currentTarget as Element).setPointerCapture?.(e.pointerId);
+  }
+
+  function handleBackgroundPointerMove(e: React.PointerEvent<HTMLDivElement>) {
+    if (!ghost) return;
+    const rect = surfaceRef.current?.getBoundingClientRect();
+    if (!rect) return;
+    const cur = clampToWindow(snapMinutes(pixelsToMinutes(e.clientY - rect.top), SUBGRID_MINUTES));
+    if (cur >= ghost.topMin) {
+      setGhost({ topMin: ghost.topMin, bottomMin: Math.max(ghost.topMin + SUBGRID_MINUTES, cur) });
+    } else {
+      setGhost({ topMin: cur, bottomMin: ghost.bottomMin });
+    }
+  }
+
+  function handleBackgroundPointerUp() {
+    if (!ghost) return;
+    const top = ghost.topMin;
+    const bottom = Math.max(top + SUBGRID_MINUTES, ghost.bottomMin);
+    setGhost(null);
+    if (!onCreate) return;
+    if (bottom - top < 15) return;
+    onCreate({
+      day,
+      startsAt: dateAtMinutes(day, top),
+      endsAt: dateAtMinutes(day, bottom),
+      siteId: defaultCreateSiteId,
+    });
+  }
+
+  function handleResizeStart(
+    e: React.PointerEvent<HTMLDivElement>,
+    shift: TimelineShift,
+    initialEndMin: number,
+  ) {
+    if (!canResize) return;
+    e.preventDefault();
+    e.stopPropagation();
+    setResize({ shiftId: shift.id, endMin: initialEndMin });
+    (e.currentTarget as Element).setPointerCapture?.(e.pointerId);
+  }
+
+  function handleResizeMove(e: React.PointerEvent<HTMLDivElement>) {
+    if (!resize) return;
+    const rect = surfaceRef.current?.getBoundingClientRect();
+    if (!rect) return;
+    const cur = clampToWindow(snapMinutes(pixelsToMinutes(e.clientY - rect.top), SUBGRID_MINUTES));
+    setResize({ ...resize, endMin: cur });
+  }
+
+  function handleResizeEnd(shift: TimelineShift) {
+    if (!resize) return;
+    const finalEnd = resize.endMin;
+    setResize(null);
+    if (!onResize) return;
+    const startMin = minutesFromMidnight(day, toDate(shift.startsAt));
+    if (finalEnd - startMin < 15) return;
+    onResize({ shift, endsAt: dateAtMinutes(day, finalEnd) });
+  }
+
+  return (
+    <div className="relative min-w-0 flex-1 border-l border-border">
+      <div className="sticky top-0 z-20 space-y-0.5 bg-card/95 px-2 py-2 text-center backdrop-blur">
+        <div className={cn("text-sm font-semibold", isToday && "text-primary")}>
+          {day.toLocaleDateString(undefined, { weekday: "short", month: "short", day: "numeric" })}
+        </div>
+        <div className="text-[10px] tabular-nums text-muted-foreground">
+          Open {dw.start}:00–{dw.end}:00
+        </div>
+        <div className="text-xs font-medium tabular-nums text-muted-foreground">
+          {daySpan ? (
+            <>
+              {formatClock(daySpan.start)} – {formatClock(daySpan.end)}
+            </>
+          ) : (
+            <span className="text-muted-foreground/80">No shifts</span>
+          )}
+        </div>
+      </div>
+      <div
+        ref={surfaceRef}
+        className={cn("relative isolate select-none", canCreate && "cursor-crosshair")}
+        style={{ height: gridHeight }}
+        onPointerDown={handleBackgroundPointerDown}
+        onPointerMove={(e) => {
+          if (ghost) handleBackgroundPointerMove(e);
+          else if (resize) handleResizeMove(e);
+        }}
+        onPointerUp={(e) => {
+          if (ghost) handleBackgroundPointerUp();
+          else if (resize) {
+            const s = shifts.find((x) => x.id === resize.shiftId);
+            if (s) handleResizeEnd(s);
+          }
+          (e.currentTarget as Element).releasePointerCapture?.(e.pointerId);
+        }}
+        onPointerCancel={() => {
+          setGhost(null);
+          setResize(null);
+        }}
+      >
+        <div
+          className="pointer-events-none absolute inset-x-0 top-0 z-[5] border-b border-dashed border-border/50 bg-muted/50"
+          style={{ height: blockedTopPx }}
+          aria-hidden
+        />
+        <div
+          className="pointer-events-none absolute inset-x-0 bottom-0 z-[5] border-t border-dashed border-border/50 bg-muted/50"
+          style={{ height: blockedBottomPx }}
+          aria-hidden
+        />
+        {Array.from({ length: HOURS_IN_DAY }, (_, h) => (
+          <div
+            key={`h-${h}`}
+            className="pointer-events-none absolute left-0 right-0 border-t border-border/40"
+            style={{ top: h * 60 * PX_PER_MINUTE }}
+          />
+        ))}
+        {Array.from({ length: Math.ceil(fullDayMinutes / SUBGRID_MINUTES) }, (_, i) => {
+          const m = i * SUBGRID_MINUTES;
+          if (m === 0 || m % 60 === 0) return null;
+          return (
+            <div
+              key={`sub-${i}`}
+              className="pointer-events-none absolute left-0 right-0 border-t border-border/20"
+              style={{ top: m * PX_PER_MINUTE }}
+            />
+          );
+        })}
+
+        {showNow && nowMin != null && (
+          <div
+            className="pointer-events-none absolute left-0 right-0 z-[60]"
+            style={{ top: nowMin * PX_PER_MINUTE }}
+            aria-hidden
+          >
+            <div className="relative h-px bg-red-500/90 shadow-[0_0_0_1px_rgba(255,255,255,0.6)]">
+              <span className="absolute -left-1 -top-1 h-2 w-2 rounded-full bg-red-500" />
+            </div>
+          </div>
+        )}
+
+        {ghost && (
+          <div
+            className="pointer-events-none absolute left-1 right-1 z-[55] rounded border-2 border-dashed border-primary/80 bg-primary/15"
+            style={{
+              top: ghost.topMin * PX_PER_MINUTE,
+              height: Math.max(8, (ghost.bottomMin - ghost.topMin) * PX_PER_MINUTE),
+            }}
+          >
+            <div className="px-1.5 py-0.5 text-[10px] font-medium tabular-nums text-primary">
+              {formatClock(dateAtMinutes(day, ghost.topMin))} – {formatClock(dateAtMinutes(day, ghost.bottomMin))}
+            </div>
+          </div>
+        )}
+
+        {shifts.flatMap((s) => {
+          const raw = segmentForDay(s, day);
+          if (!raw) return [];
+          const seg = clipSegmentToVisibleHours(raw, day, dw.start, dw.end);
+          if (!seg) return [];
+          const slots = iterSlotSegments(seg.segStart, seg.segEnd, slotStepMinutes);
+
+          const assigneeId = s.assignee?.id;
+          const isOpen = !assigneeId;
+          const isMine = Boolean(currentUserId && assigneeId === currentUserId);
+          const pend = pendingByShift.get(s.id) ?? [];
+          const myPending = currentUserId ? pend.some((p) => p.requesterId === currentUserId) : false;
+          const otherPending = pend.some((p) => p.requesterId !== currentUserId);
+
+          const canPickOpen = isOpen && s.status === "PUBLISHED";
+          const canSwapMine = isMine;
+          const isBooked = Boolean(assigneeId && s.status === "PUBLISHED");
+          const isBookedMine = isBooked && isMine;
+          const isBookedOther = isBooked && !isMine;
+          const hasHandler = Boolean(onSlotClick || onShiftClick);
+          // Any tile is clickable when a handler is wired — the modal decides what to show
+          // (booking, swap, or read-only site details + admin comments).
+          const canInteract = hasHandler;
+          const isPassive = !canPickOpen && !canSwapMine;
+
+          // Live resize override: if this shift is being resized, replace last slot's end
+          const liveResizingMin = resize?.shiftId === s.id ? resize.endMin : null;
+
+          return slots.map((slot, slotIdx) => {
+            let startMin = minutesFromMidnight(day, slot.slotStart);
+            let endMin = minutesFromMidnight(day, slot.slotEnd);
+            if (liveResizingMin != null && slotIdx === slots.length - 1) {
+              endMin = Math.max(startMin + 15, liveResizingMin);
+            }
+            const top = Math.max(0, startMin * PX_PER_MINUTE);
+            const height = Math.max(28, (endMin - startMin) * PX_PER_MINUTE);
+
+            const timeLine = `${toDate(slot.slotStart).toLocaleTimeString(undefined, {
+              hour: "numeric",
+              minute: "2-digit",
+            })} – ${toDate(slot.slotEnd).toLocaleTimeString(undefined, {
+              hour: "numeric",
+              minute: "2-digit",
+            })}`;
+
+            const stackKey = Math.round(top * 100) + slotIdx;
+            const z = canInteract ? 40 + (stackKey % 50) : 10 + (stackKey % 20);
+
+            const isLast = slotIdx === slots.length - 1;
+
+            return (
+              <div
+                key={`${s.id}-${day.toISOString()}-${slotIdx}`}
+                className="absolute left-1 right-1"
+                style={{ top, height, zIndex: z }}
+              >
+                <button
+                  type="button"
+                  aria-disabled={!canInteract}
+                  tabIndex={canInteract ? 0 : -1}
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    if (!canInteract) return;
+                    onActivate(s, slot);
+                  }}
+                  className={cn(
+                    "absolute inset-0 overflow-hidden rounded border px-1.5 py-0.5 text-left text-[10px] shadow-sm transition",
+                    "focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring",
+                    canInteract ? "cursor-pointer hover:opacity-95 active:opacity-100" : "cursor-default",
+                    isPassive && "opacity-90",
+                    canPickOpen && s.status === "PUBLISHED" && "border-dashed",
+                    isBookedMine && "border-2 border-emerald-600/55 ring-1 ring-emerald-500/25",
+                    isBookedOther && "border-2 border-violet-600/45 ring-1 ring-violet-500/20",
+                    myPending && "ring-2 ring-amber-400/80",
+                  )}
+                  style={{
+                    backgroundColor: isBookedMine
+                      ? `${s.site.colorHex}40`
+                      : isBookedOther
+                        ? `${s.site.colorHex}38`
+                        : `${s.site.colorHex}22`,
+                    borderLeftWidth: 3,
+                    borderLeftColor: s.site.colorHex,
+                  }}
+                  title={`${s.site.name} — ${timeLine}${
+                    canInteract
+                      ? canPickOpen
+                        ? " (click to book)"
+                        : canSwapMine
+                          ? " (click to swap)"
+                          : isBookedOther
+                            ? " (click to request swap / details)"
+                            : " (click for details)"
+                      : ""
+                  }`}
+                >
+                  <div className="truncate font-semibold leading-tight" style={{ color: s.site.colorHex }}>
+                    {s.site.name}
+                    {isBooked && (
+                      <span className="ml-1 rounded bg-foreground/10 px-1 py-px text-[8px] font-bold uppercase tracking-wide text-foreground/80">
+                        Booked
+                      </span>
+                    )}
+                  </div>
+                  <div className="truncate text-[9px] text-muted-foreground">
+                    {canPickOpen ? (
+                      <span>Open</span>
+                    ) : isMine ? (
+                      <span className="font-medium text-emerald-800 dark:text-emerald-200">You</span>
+                    ) : (
+                      <span className="font-medium text-foreground">{s.assignee?.name ?? "—"}</span>
+                    )}
+                    {myPending && (
+                      <span className="ml-0.5 font-medium text-amber-700 dark:text-amber-300">· Pending</span>
+                    )}
+                    {!myPending && otherPending && (
+                      <span className="ml-0.5 font-medium text-amber-700 dark:text-amber-300">· Review</span>
+                    )}
+                  </div>
+                  <div className="tabular-nums text-[9px] font-medium text-foreground">{timeLine}</div>
+                </button>
+                {canResize && isLast && (
+                  <div
+                    role="separator"
+                    aria-label="Resize shift end"
+                    className="absolute inset-x-0 bottom-0 h-2 cursor-ns-resize bg-foreground/10 hover:bg-foreground/20"
+                    onPointerDown={(e) => handleResizeStart(e, s, endMin)}
+                  />
+                )}
+              </div>
+            );
+          });
+        })}
       </div>
     </div>
   );

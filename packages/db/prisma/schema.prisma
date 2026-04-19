@@ -70,6 +70,7 @@ model User {
   updatedAt DateTime @updatedAt
 
   shiftsAssigned        Shift[]              @relation("ShiftAssignee")
+  shiftComments         ShiftComment[]       @relation("ShiftCommentAuthor")
   giveUpRequests        GiveUpRequest[]      @relation("GiveUpRequester")
   pickupRequests        PickupRequest[]      @relation("PickupRequester")
   swapRequestsAsA       SwapRequest[]        @relation("SwapUserA")
@@ -139,15 +140,31 @@ model Shift {
   status            ShiftStatus       @default(DRAFT)
   assigneeId        String?
   assignee          User?             @relation("ShiftAssignee", fields: [assigneeId], references: [id])
+  /** Free-text admin note rendered in the shift detail modal (read-only to physicians). */
+  adminNotes        String?
 
   giveUpRequests GiveUpRequest[]
   pickupRequests PickupRequest[]
   swapRequestsA  SwapRequest[]   @relation("SwapShiftA")
   swapRequestsB  SwapRequest[]   @relation("SwapShiftB")
   auditLogs      AuditLog[]
+  comments       ShiftComment[]
 
   @@index([scheduleVersionId, startsAt])
   @@index([assigneeId, startsAt])
+}
+
+/** Threaded admin comments shown to everyone on the shift detail modal. */
+model ShiftComment {
+  id        String   @id @default(cuid())
+  shiftId   String
+  shift     Shift    @relation(fields: [shiftId], references: [id], onDelete: Cascade)
+  authorId  String
+  author    User     @relation("ShiftCommentAuthor", fields: [authorId], references: [id])
+  body      String
+  createdAt DateTime @default(now())
+
+  @@index([shiftId, createdAt])
 }
 
 model GiveUpRequest {
@@ -178,6 +195,10 @@ model PickupRequest {
   /// Physician-selected window within the shift (optional; min 15 min when set)
   preferredStartsAt DateTime?
   preferredEndsAt   DateTime?
+  /// Free-text message from the requester to the admin reviewing this pickup
+  requesterNote     String?
+  /// Optional message from admin to the physician when approving (also in notification)
+  adminApprovalNote String?
 
   @@index([shiftId, status])
 }
