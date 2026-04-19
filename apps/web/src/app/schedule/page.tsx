@@ -12,6 +12,7 @@ import {
   WeekTimeline,
   formatShiftTimeRange,
   type DayWindow,
+  type PendingPickup,
   type SlotPick,
   type SlotStepMinutes,
   type TimelineShift,
@@ -138,14 +139,23 @@ export default function SchedulePage() {
       from: range.from,
       to: range.to,
     },
-    { enabled: !!activeVersionId },
+    {
+      enabled: !!activeVersionId,
+      /** Admin approvals happen out-of-band; keep the calendar from staying stale. */
+      refetchInterval: 25_000,
+      refetchOnWindowFocus: true,
+    },
   );
 
   const shiftIds = useMemo(() => shifts.data?.map((s) => s.id) ?? [], [shifts.data]);
 
   const pendingPickups = trpc.workflow.pickupRequestsForShifts.useQuery(
     { shiftIds },
-    { enabled: shiftIds.length > 0 },
+    {
+      enabled: shiftIds.length > 0,
+      refetchInterval: 12_000,
+      refetchOnWindowFocus: true,
+    },
   );
 
   const mySwaps = trpc.workflow.listMySwapRequests.useQuery(undefined, {
@@ -154,7 +164,33 @@ export default function SchedulePage() {
 
   const myPickups = trpc.workflow.myPickupRequests.useQuery(undefined, {
     enabled: Boolean(me.data?.user),
+    /** Detect admin approve/deny without a full page reload. */
+    refetchInterval: 8_000,
+    refetchOnWindowFocus: true,
   });
+
+  const myPickupStatusSig = useMemo(
+    () =>
+      (myPickups.data ?? [])
+        .map((p) => `${p.id}:${p.status}`)
+        .sort()
+        .join("|"),
+    [myPickups.data],
+  );
+  const myPickupSigPrev = useRef<string | null>(null);
+  useEffect(() => {
+    if (!me.data?.user) {
+      myPickupSigPrev.current = null;
+      return;
+    }
+    if (myPickups.isLoading) return;
+    const prev = myPickupSigPrev.current;
+    if (prev !== null && prev !== myPickupStatusSig) {
+      void utils.shift.list.invalidate();
+      void utils.workflow.pickupRequestsForShifts.invalidate();
+    }
+    myPickupSigPrev.current = myPickupStatusSig;
+  }, [me.data?.user, myPickups.isLoading, myPickupStatusSig, utils]);
 
   const requestPickup = trpc.workflow.requestPickup.useMutation({
     onSuccess: async () => {
@@ -264,17 +300,26 @@ export default function SchedulePage() {
         const sid = siteIdByShift.get(s.id);
         if (!sid || !siteFilter.has(sid)) return false;
       }
+      // Open = unassigned (People chips do not apply — no assignee on these rows).
       if (statusFilter === "open" && s.assignee) return false;
-      if (statusFilter === "mine" && (!myId || s.assignee?.id !== myId)) return false;
-      if (statusFilter === "others" && (!s.assignee || (myId && s.assignee.id === myId))) {
-        return false;
+      // Until `me` resolves, do not treat "Mine" as "exclude everything" (undefined myId used to hide all rows).
+      if (statusFilter === "mine" && myId && s.assignee?.id !== myId) return false;
+      if (statusFilter === "others") {
+        if (!s.assignee) return false;
+        if (myId && s.assignee.id === myId) return false;
       }
-      if (assigneeFilter.size > 0) {
+      if (assigneeFilter.size > 0 && statusFilter !== "open") {
         if (!s.assignee || !assigneeFilter.has(s.assignee.id)) return false;
       }
       return true;
     });
   }, [allTimelineShifts, siteFilter, siteIdByShift, statusFilter, assigneeFilter, me.data?.user.id]);
+
+  /** Query finished (including empty list); distinct from initial undefined before first response. */
+  const timelineReady = Boolean(activeVersionId && timelineShifts !== undefined);
+  const shiftsExistInRange = (shifts.data?.length ?? 0) > 0;
+  const filtersHideAllShifts =
+    timelineReady && shiftsExistInRange && (timelineShifts?.length ?? 0) === 0;
 
   const isAdmin = me.data?.user.role === "ADMIN";
 
@@ -904,11 +949,23 @@ export default function SchedulePage() {
           </Card>
         )}
 
-        {activeVersionId && timelineShifts && timelineShifts.length > 0 && calendarMode !== "month" && (
+        {filtersHideAllShifts && (
+          <Card>
+            <CardHeader>
+              <CardTitle>No shifts match your filters</CardTitle>
+              <CardDescription>
+                Try setting Status to All, clearing Sites or People, or picking a different date range. Open shifts
+                always ignore the People filter.
+              </CardDescription>
+            </CardHeader>
+          </Card>
+        )}
+
+        {timelineReady && calendarMode !== "month" && (
           <WeekTimeline
             weekStart={calendarMode === "day" ? dayAnchor : weekAnchor}
             daysToShow={calendarMode === "day" ? 1 : 7}
-            shifts={timelineShifts}
+            shifts={timelineShifts ?? []}
             currentUserId={uid}
             pendingPickups={pendingPickups.data ?? []}
             slotStepMinutes={slotStepMinutes}
@@ -947,11 +1004,12 @@ export default function SchedulePage() {
           />
         )}
 
-        {activeVersionId && timelineShifts && timelineShifts.length > 0 && calendarMode === "month" && (
+        {timelineReady && calendarMode === "month" && (
           <MonthGrid
             monthAnchor={monthAnchor}
-            shifts={timelineShifts}
+            shifts={timelineShifts ?? []}
             currentUserId={uid}
+            pendingPickups={pendingPickups.data ?? []}
             onShiftClick={(shift) => {
               // Reuse the existing modal: synthesize a slot covering the whole shift since
               // Month view doesn't have a sub-hour click target.
@@ -1369,11 +1427,13 @@ function MonthGrid({
   monthAnchor,
   shifts,
   currentUserId,
+  pendingPickups = [],
   onShiftClick,
 }: {
   monthAnchor: Date;
   shifts: TimelineShift[];
   currentUserId?: string | null;
+  pendingPickups?: PendingPickup[];
   onShiftClick: (shift: TimelineShift) => void;
 }) {
   const cells = useMemo(() => {
@@ -1405,6 +1465,20 @@ function MonthGrid({
     }
     return m;
   }, [shifts]);
+
+  const pendingRequestersByShift = useMemo(() => {
+    const acc = new Map<string, string[]>();
+    for (const p of pendingPickups) {
+      const list = acc.get(p.shiftId) ?? [];
+      list.push(p.requester.name);
+      acc.set(p.shiftId, list);
+    }
+    const m = new Map<string, string>();
+    for (const [shiftId, names] of acc) {
+      m.set(shiftId, [...new Set(names)].join(", "));
+    }
+    return m;
+  }, [pendingPickups]);
 
   const monthIndex = monthAnchor.getMonth();
 
@@ -1453,6 +1527,8 @@ function MonthGrid({
                   const mine = currentUserId && s.assignee?.id === currentUserId;
                   const open = !s.assignee && s.status === "PUBLISHED";
                   const booked = Boolean(s.assignee && s.status === "PUBLISHED");
+                  const pendingNames = pendingRequestersByShift.get(s.id);
+                  const openAwaitingReview = open && pendingNames;
                   return (
                     <li key={s.id}>
                       <button
@@ -1463,15 +1539,25 @@ function MonthGrid({
                           (booked && mine
                             ? "ring-1 ring-emerald-600/40"
                             : booked
-                              ? "ring-1 ring-violet-600/35"
-                              : "")
+                              ? "ring-1 ring-sky-600/40 dark:ring-sky-500/35"
+                              : openAwaitingReview
+                                ? "ring-1 ring-amber-500/50"
+                                : "")
                         }
                         style={{
-                          backgroundColor: booked ? `${s.site.colorHex}38` : `${s.site.colorHex}22`,
+                          backgroundColor: booked
+                            ? `${s.site.colorHex}38`
+                            : openAwaitingReview
+                              ? `${s.site.colorHex}1a`
+                              : `${s.site.colorHex}22`,
                           borderLeft: `3px solid ${s.site.colorHex}`,
                         }}
                         title={`${s.site.name} · ${formatShiftTimeRange(s.startsAt, s.endsAt)}${
-                          s.assignee ? ` · ${s.assignee.name} (booked)` : " · Open"
+                          s.assignee
+                            ? ` · ${s.assignee.name} (assigned)`
+                            : pendingNames
+                              ? ` · Open — requested by ${pendingNames}`
+                              : " · Open"
                         }`}
                       >
                         <span className="font-medium">
@@ -1483,15 +1569,22 @@ function MonthGrid({
                         <span className="text-muted-foreground">{s.site.name}</span>
                         {mine && booked && (
                           <span className="ml-1 text-[10px] font-semibold text-emerald-800 dark:text-emerald-200">
-                            · you · booked
+                            · you
                           </span>
                         )}
                         {!mine && booked && (
-                          <span className="ml-1 text-[10px] font-medium text-violet-900 dark:text-violet-200">
+                          <span className="ml-1 text-[10px] font-medium text-sky-950 dark:text-sky-100">
                             · {s.assignee?.name ?? "—"}
                           </span>
                         )}
-                        {open && <span className="ml-1 text-[10px] text-emerald-700 dark:text-emerald-300">· open</span>}
+                        {openAwaitingReview && (
+                          <span className="ml-1 text-[10px] font-medium text-amber-950 dark:text-amber-100">
+                            · {pendingNames}
+                          </span>
+                        )}
+                        {open && !openAwaitingReview && (
+                          <span className="ml-1 text-[10px] text-emerald-700 dark:text-emerald-300">· open</span>
+                        )}
                       </button>
                     </li>
                   );

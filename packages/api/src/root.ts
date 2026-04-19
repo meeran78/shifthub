@@ -863,7 +863,12 @@ export const appRouter = router({
             shiftId: { in: input.shiftIds },
             status: "PENDING",
           },
-          select: { id: true, shiftId: true, requesterId: true },
+          select: {
+            id: true,
+            shiftId: true,
+            requesterId: true,
+            requester: { select: { name: true } },
+          },
         });
       }),
 

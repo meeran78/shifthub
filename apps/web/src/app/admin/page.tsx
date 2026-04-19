@@ -7,7 +7,10 @@ import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/com
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { useEffect, useMemo, useState } from "react";
+import { cn } from "@/lib/utils";
 import { formatShiftTimeRange } from "@/components/week-timeline";
+
+type AdminWorkspaceTab = "slotRequests" | "slotHistory" | "swaps" | "versions" | "scheduleShift";
 
 type ScheduleScope = "day" | "week" | "month" | "year";
 
@@ -134,12 +137,14 @@ export default function AdminPage() {
       await pendingPickups.refetch();
       await recentPickupDecisions.refetch();
       await utils.shift.list.invalidate();
+      await utils.workflow.pickupRequestsForShifts.invalidate();
     },
   });
   const denyPickup = trpc.workflow.denyPickup.useMutation({
     onSuccess: async () => {
       await pendingPickups.refetch();
       await recentPickupDecisions.refetch();
+      await utils.workflow.pickupRequestsForShifts.invalidate();
     },
   });
   const approveSwap = trpc.workflow.approveSwapAdmin.useMutation({
@@ -190,6 +195,7 @@ export default function AdminPage() {
   const [pickupDenyNotes, setPickupDenyNotes] = useState<Record<string, string>>({});
   const [pickupApproveNotes, setPickupApproveNotes] = useState<Record<string, string>>({});
   const [swapDenyNotes, setSwapDenyNotes] = useState<Record<string, string>>({});
+  const [adminTab, setAdminTab] = useState<AdminWorkspaceTab>("versions");
 
   // AI-assisted scheduling state
   const [aiStartHour, setAiStartHour] = useState(7);
@@ -236,45 +242,61 @@ export default function AdminPage() {
       </header>
 
       <main className="mx-auto max-w-3xl space-y-6 p-4">
-        {!isAdmin && (
-          <Card>
-            <CardHeader>
-              <CardTitle>Admin access required</CardTitle>
-              <CardDescription>
-                Roles are stored only in the database (Neon), not in Clerk. Clerk is for sign-in only. Grant{" "}
-                <strong>ADMIN</strong> using one of the options below, then open{" "}
-                <Link href="/schedule" className="text-primary underline">
-                  Schedule
-                </Link>{" "}
-                once so your profile sync runs again.
-              </CardDescription>
-            </CardHeader>
-            <CardContent className="space-y-3 text-sm text-muted-foreground">
-              <p>
-                <strong className="text-foreground">Option A — env allowlist (dev):</strong> In your repo{" "}
-                <code className="rounded bg-muted px-1">.env.local</code>, set{" "}
-                <code className="rounded bg-muted px-1">ADMIN_EMAILS=you@yourdomain.com</code> (comma-separated for
-                multiple). Restart <code className="rounded bg-muted px-1">pnpm dev</code>, then visit{" "}
-                <Link href="/schedule" className="text-primary underline">
-                  Schedule
-                </Link>
-                .
-              </p>
-              <p>
-                <strong className="text-foreground">Option B — database:</strong> Run{" "}
-                <code className="rounded bg-muted px-1">pnpm db:studio</code> and set{" "}
-                <code className="rounded bg-muted px-1">User.role</code> to{" "}
-                <code className="rounded bg-muted px-1">ADMIN</code> for your row (or use a SQL migration in production).
-              </p>
-            </CardContent>
-          </Card>
+        {me.isLoading && <AdminAccessLoader />}
+
+        {!me.isLoading && !isAdmin && (
+          <p className="py-16 text-center text-sm text-muted-foreground">
+            This page is for administrators.{" "}
+            <Link href="/schedule" className="text-primary underline">
+              Back to schedule
+            </Link>
+          </p>
         )}
 
         {isAdmin && (
-          <>
-            <Card>
-              <CardHeader>
-                <CardTitle>Physician slot requests</CardTitle>
+          <div className="space-y-4">
+            <div
+              className="flex flex-wrap gap-1 rounded-lg border border-border bg-muted/40 p-1 shadow-sm"
+              role="tablist"
+              aria-label="Admin sections"
+            >
+              {(
+                [
+                  ["versions", "Schedule versions"],
+                  ["scheduleShift", "Schedule a shift"],
+                  ["slotRequests", "Physician Slot"],
+                  ["slotHistory", "Recent Slot"],
+                  ["swaps", "Shift Swap"],
+                 
+                ] as const satisfies ReadonlyArray<readonly [AdminWorkspaceTab, string]>
+              ).map(([id, label]) => (
+                <button
+                  key={id}
+                  type="button"
+                  role="tab"
+                  aria-selected={adminTab === id}
+                  onClick={() => setAdminTab(id)}
+                  className={cn(
+                    "rounded-md px-3 py-2 text-sm font-medium outline-none transition-all duration-200",
+                    "focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2",
+                    adminTab === id
+                      ? "bg-background text-foreground shadow-sm ring-1 ring-border"
+                      : "text-muted-foreground hover:bg-background/70 hover:text-foreground",
+                  )}
+                >
+                  {label}
+                </button>
+              ))}
+            </div>
+
+            {adminTab === "slotRequests" && (
+              <div
+                key="slotRequests"
+                className="animate-in fade-in slide-in-from-bottom-2 duration-200 motion-reduce:animate-none"
+              >
+                <Card>
+                  <CardHeader>
+                    <CardTitle>Physician slot requests</CardTitle>
                 <CardDescription>
                   Open-shift pickup requests from physicians. Each row shows their selected time window and any note
                   they left. You can approve with an optional message to the physician, or reject with a required
@@ -438,7 +460,14 @@ export default function AdminPage() {
                 ))}
               </CardContent>
             </Card>
+              </div>
+            )}
 
+            {adminTab === "slotHistory" && (
+              <div
+                key="slotHistory"
+                className="animate-in fade-in slide-in-from-bottom-2 duration-200 motion-reduce:animate-none"
+              >
             <Card>
               <CardHeader>
                 <CardTitle>Recent slot request decisions</CardTitle>
@@ -521,7 +550,14 @@ export default function AdminPage() {
                   ))}
               </CardContent>
             </Card>
+              </div>
+            )}
 
+            {adminTab === "swaps" && (
+              <div
+                key="swaps"
+                className="animate-in fade-in slide-in-from-bottom-2 duration-200 motion-reduce:animate-none"
+              >
             <Card>
               <CardHeader>
                 <CardTitle>Shift swap pipeline</CardTitle>
@@ -630,7 +666,14 @@ export default function AdminPage() {
                 })}
               </CardContent>
             </Card>
+              </div>
+            )}
 
+            {adminTab === "versions" && (
+              <div
+                key="versions"
+                className="animate-in fade-in slide-in-from-bottom-2 duration-200 motion-reduce:animate-none"
+              >
             <Card>
               <CardHeader>
                 <CardTitle>Schedule versions</CardTitle>
@@ -701,7 +744,13 @@ export default function AdminPage() {
                               type="button"
                               variant="ghost"
                               size="sm"
-                              onClick={() => setVersionId(v.id)}
+                              onClick={() => {
+                                setVersionId(v.id);
+                                setYearValue(v.year);
+                                const y = String(v.year);
+                                setMonthValue(`${y}-01`);
+                                setAdminTab("scheduleShift");
+                              }}
                             >
                               Use in form
                             </Button>
@@ -729,7 +778,14 @@ export default function AdminPage() {
                 </div>
               </CardContent>
             </Card>
+              </div>
+            )}
 
+            {adminTab === "scheduleShift" && (
+              <div
+                key="scheduleShift"
+                className="animate-in fade-in slide-in-from-bottom-2 duration-200 motion-reduce:animate-none"
+              >
             <Card>
               <CardHeader>
                 <CardTitle>Schedule a shift</CardTitle>
@@ -1178,9 +1234,28 @@ export default function AdminPage() {
                 </div>
               </CardContent>
             </Card>
-          </>
+              </div>
+            )}
+          </div>
         )}
       </main>
+    </div>
+  );
+}
+
+function AdminAccessLoader() {
+  return (
+    <div
+      className="flex min-h-[45vh] flex-col items-center justify-center gap-4 py-16"
+      aria-busy="true"
+      aria-live="polite"
+      aria-label="Checking admin access"
+    >
+      <div
+        className="h-11 w-11 animate-spin rounded-full border-2 border-muted border-t-primary"
+        role="presentation"
+      />
+      <p className="text-sm text-muted-foreground">Checking admin access…</p>
     </div>
   );
 }

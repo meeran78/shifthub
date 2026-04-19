@@ -22,7 +22,12 @@ export type TimelineShift = {
 
 export type SlotPick = { slotStart: Date; slotEnd: Date };
 
-export type PendingPickup = { id: string; shiftId: string; requesterId: string };
+export type PendingPickup = {
+  id: string;
+  shiftId: string;
+  requesterId: string;
+  requester: { name: string };
+};
 
 export type SlotStepMinutes = 15 | 30;
 
@@ -596,8 +601,13 @@ function DayColumn({
           const pend = pendingByShift.get(s.id) ?? [];
           const myPending = currentUserId ? pend.some((p) => p.requesterId === currentUserId) : false;
           const otherPending = pend.some((p) => p.requesterId !== currentUserId);
+          const pendingRequesterNames =
+            pend.length > 0
+              ? [...new Set(pend.map((p) => p.requester.name))].join(", ")
+              : "";
 
           const canPickOpen = isOpen && s.status === "PUBLISHED";
+          const openWithPendingReview = canPickOpen && pend.length > 0;
           const canSwapMine = isMine;
           const isBooked = Boolean(assigneeId && s.status === "PUBLISHED");
           const isBookedMine = isBooked && isMine;
@@ -654,8 +664,10 @@ function DayColumn({
                     canInteract ? "cursor-pointer hover:opacity-95 active:opacity-100" : "cursor-default",
                     isPassive && "opacity-90",
                     canPickOpen && s.status === "PUBLISHED" && "border-dashed",
+                    openWithPendingReview &&
+                      "border-amber-600/45 bg-amber-500/[0.14] ring-1 ring-amber-500/45 dark:border-amber-400/35 dark:bg-amber-500/10",
                     isBookedMine && "border-2 border-emerald-600/55 ring-1 ring-emerald-500/25",
-                    isBookedOther && "border-2 border-violet-600/45 ring-1 ring-violet-500/20",
+                    isBookedOther && "border-2 border-sky-600/50 ring-1 ring-sky-500/25 dark:border-sky-400/45",
                     myPending && "ring-2 ring-amber-400/80",
                   )}
                   style={{
@@ -663,11 +675,15 @@ function DayColumn({
                       ? `${s.site.colorHex}40`
                       : isBookedOther
                         ? `${s.site.colorHex}38`
-                        : `${s.site.colorHex}22`,
+                        : openWithPendingReview
+                          ? `${s.site.colorHex}18`
+                          : `${s.site.colorHex}22`,
                     borderLeftWidth: 3,
                     borderLeftColor: s.site.colorHex,
                   }}
                   title={`${s.site.name} — ${timeLine}${
+                    pendingRequesterNames ? ` — requested by ${pendingRequesterNames}` : ""
+                  }${s.assignee?.name ? ` — ${s.assignee.name}` : ""}${
                     canInteract
                       ? canPickOpen
                         ? " (click to book)"
@@ -683,23 +699,32 @@ function DayColumn({
                     {s.site.name}
                     {isBooked && (
                       <span className="ml-1 rounded bg-foreground/10 px-1 py-px text-[8px] font-bold uppercase tracking-wide text-foreground/80">
-                        Booked
+                        Assigned
                       </span>
                     )}
                   </div>
                   <div className="truncate text-[9px] text-muted-foreground">
                     {canPickOpen ? (
-                      <span>Open</span>
+                      openWithPendingReview ? (
+                        <span className="block truncate">
+                          <span className="font-medium text-amber-900 dark:text-amber-100">Open · </span>
+                          <span className="text-foreground/90">{pendingRequesterNames}</span>
+                        </span>
+                      ) : (
+                        <span>Open</span>
+                      )
                     ) : isMine ? (
                       <span className="font-medium text-emerald-800 dark:text-emerald-200">You</span>
                     ) : (
-                      <span className="font-medium text-foreground">{s.assignee?.name ?? "—"}</span>
+                      <span className="font-medium text-sky-950 dark:text-sky-100">
+                        {s.assignee?.name ?? "—"}
+                      </span>
                     )}
                     {myPending && (
-                      <span className="ml-0.5 font-medium text-amber-700 dark:text-amber-300">· Pending</span>
+                      <span className="ml-0.5 font-medium text-amber-700 dark:text-amber-300">· Your request</span>
                     )}
                     {!myPending && otherPending && (
-                      <span className="ml-0.5 font-medium text-amber-700 dark:text-amber-300">· Review</span>
+                      <span className="ml-0.5 font-medium text-amber-700 dark:text-amber-300">· Admin review</span>
                     )}
                   </div>
                   <div className="tabular-nums text-[9px] font-medium text-foreground">{timeLine}</div>
